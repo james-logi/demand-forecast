@@ -389,8 +389,21 @@ function fitSARIMA(s, periods) {
   if (s.length < m + 12) return fitARIMA(s, periods);
   const seasDiff = [];
   for (let i = m; i < s.length; i++) seasDiff.push(s[i] - s[i - m]);
-  // 계절 차분된 시리즈에 ARIMA 예측
-  const fcSeasDiff = fitARIMA(seasDiff, periods);
+  // 계절 차분된 시리즈는 보통 정상성을 가지므로 ARIMA d=0 적용
+  // (원본의 d를 그대로 사용하면 이중 차분이 되어 발산 위험)
+  const savedD = STATE.params.arD;
+  STATE.params.arD = 0;
+  let fcSeasDiff;
+  try {
+    fcSeasDiff = fitARIMA(seasDiff, periods);
+  } finally {
+    STATE.params.arD = savedD;
+  }
+  // 발산 방지: 계절차분 예측이 비현실적으로 크면 클램핑
+  const seasMean = seasDiff.reduce((a, b) => a + b, 0) / seasDiff.length;
+  const seasStd = Math.sqrt(seasDiff.reduce((s, v) => s + (v - seasMean) ** 2, 0) / seasDiff.length);
+  const cap = 3 * seasStd; // ±3σ
+  fcSeasDiff = fcSeasDiff.map(v => Math.max(seasMean - cap, Math.min(seasMean + cap, v)));
   // 계절 역변환: 미래 값 = 12개월 전 값 + 예측된 계절차분
   const out = [];
   for (let h = 0; h < periods; h++) {
@@ -692,10 +705,14 @@ function computeAllForecasts() {
     const predictions = {};
     const accuracies = {};
     const stds = {};
+    // 양수 시리즈 검출 (학습 데이터가 모두 ≥0이면 예측도 음수가 되지 않도록 가드)
+    const isNonNegative = trainValues.every(v => v >= 0);
+    const clampNN = arr => isNonNegative ? arr.map(v => Math.max(0, v)) : arr;
+
     STATE.selectedModels.forEach(k => {
       if (!MODELS[k] || !MODELS[k].enabled) return;
       try {
-        predictions[k] = MODEL_FN[k](trainValues, periods);
+        predictions[k] = clampNN(MODEL_FN[k](trainValues, periods));
         accuracies[k] = backtestMape(trainValues, k);
         stds[k] = residualStd(trainValues, k);
       } catch (e) {
@@ -712,17 +729,22 @@ function computeAllForecasts() {
         validKeys.forEach(k => s += predictions[k][i]);
         ens.push(s / validKeys.length);
       }
-      predictions.ensemble = ens;
+      predictions.ensemble = clampNN(ens);
       const stdAvg = validKeys.map(k => stds[k]).reduce((a, b) => a + b, 0) / validKeys.length;
       stds.ensemble = stdAvg / Math.sqrt(validKeys.length);
     }
 
-    // 신뢰구간
+    // 신뢰구간 (양수 시리즈는 lower bound도 0으로 클램핑)
     const intervals = {};
     Object.keys(predictions).forEach(k => {
       intervals[k] = predictions[k].map((v, i) => {
         const margin = z * (stds[k] || 0) * Math.sqrt(i + 1);
-        return { lower: v - margin, upper: v + margin };
+        const lower = v - margin;
+        const upper = v + margin;
+        return {
+          lower: isNonNegative ? Math.max(0, lower) : lower,
+          upper,
+        };
       });
     });
 
@@ -1059,15 +1081,22 @@ function renderChart() {
           lower.push(`${xScale(visIdx)},${yScale(intv.lower, item.metric)}`);
         });
         if (upper.length > 0) {
-          // 마지막 실측에서 시작
+          // 폴리곤 점 순서:
+          //   [마지막실측, upper(좌→우), lower(우→좌), 마지막실측] 으로 시계방향 폐곡선 형성
           const lastVisIdx = forecastStart - 1 - visStartIdx;
+          const polyPoints = [];
           if (lastVisIdx >= 0 && lastVisIdx < N) {
             const lastVal = item.fullSeries[item.fullSeries.length - 1].value;
-            upper.unshift(`${xScale(lastVisIdx)},${yScale(lastVal, item.metric)}`);
-            lower.push(`${xScale(lastVisIdx)},${yScale(lastVal, item.metric)}`);
+            const startPoint = `${xScale(lastVisIdx)},${yScale(lastVal, item.metric)}`;
+            polyPoints.push(startPoint);
+            polyPoints.push(...upper);
+            polyPoints.push(...[...lower].reverse());
+          } else {
+            polyPoints.push(...upper);
+            polyPoints.push(...[...lower].reverse());
           }
           el('polygon', {
-            points: [...upper, ...lower.reverse()].join(' '),
+            points: polyPoints.join(' '),
             fill: baseColor, opacity: isEnsemble ? 0.12 : 0.07, stroke: 'none',
           });
         }
