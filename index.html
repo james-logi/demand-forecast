@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>수요예측 시스템 · Demand Forecast Studio</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Pretendard:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+<link href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/static/pretendard.css" rel="stylesheet" />
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/file-saver@2.0.5/dist/FileSaver.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/docx@8.5.0/build/index.umd.js"></script>
+<style>
+  :root {
+    --bg-0: #060814;
+    --bg-1: #0b1023;
+    --bg-2: #131938;
+    --line: #1f2547;
+    --text-0: #f1f4ff;
+    --text-1: #aab1d6;
+    --text-2: #6b7299;
+    --accent: #00e0c6;
+    --accent-2: #6366f1;
+    --accent-3: #f472b6;
+    --warn: #f59e0b;
+    --pos: #10b981;
+    --neg: #ef4444;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    background: var(--bg-0);
+    color: var(--text-0);
+    font-family: 'Pretendard', -apple-system, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  body {
+    background:
+      radial-gradient(1200px 700px at 12% -10%, rgba(99,102,241,0.18), transparent 60%),
+      radial-gradient(900px 600px at 95% 20%, rgba(0,224,198,0.12), transparent 55%),
+      radial-gradient(700px 500px at 50% 110%, rgba(244,114,182,0.10), transparent 60%),
+      var(--bg-0);
+    min-height: 100vh;
+  }
+  .glass {
+    background: linear-gradient(180deg, rgba(19,25,56,0.55), rgba(11,16,35,0.85));
+    border: 1px solid rgba(255,255,255,0.06);
+    backdrop-filter: blur(8px);
+  }
+  .glow {
+    box-shadow: 0 0 0 1px rgba(0,224,198,0.15), 0 8px 30px rgba(0,224,198,0.08);
+  }
+  .num { font-family: 'JetBrains Mono', monospace; }
+  .scrollbar-thin::-webkit-scrollbar { width: 6px; height: 6px; }
+  .scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
+  .scrollbar-thin::-webkit-scrollbar-thumb { background: #2a3163; border-radius: 3px; }
+  input[type=range] {
+    -webkit-appearance: none;
+    background: transparent;
+  }
+  input[type=range]::-webkit-slider-runnable-track {
+    height: 4px;
+    background: linear-gradient(90deg, var(--accent), var(--accent-2));
+    border-radius: 2px;
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    height: 14px; width: 14px;
+    background: var(--text-0);
+    border: 2px solid var(--accent);
+    border-radius: 50%;
+    margin-top: -5px;
+    cursor: pointer;
+  }
+  .tab-active {
+    background: linear-gradient(180deg, rgba(0,224,198,0.15), rgba(99,102,241,0.10));
+    border-color: var(--accent) !important;
+    color: var(--accent);
+  }
+  details > summary { list-style: none; cursor: pointer; }
+  details > summary::-webkit-details-marker { display: none; }
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 600;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.08);
+  }
+  .chip-dot { width: 8px; height: 8px; border-radius: 50%; }
+  .btn-primary {
+    background: linear-gradient(135deg, var(--accent) 0%, var(--accent-2) 100%);
+    color: #06121a;
+    font-weight: 700;
+    border: none;
+    transition: all 0.15s;
+  }
+  .btn-primary:hover { transform: translateY(-1px); box-shadow: 0 8px 20px rgba(0,224,198,0.30); }
+  .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+  .btn-ghost {
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.10);
+    color: var(--text-0);
+    transition: all 0.15s;
+  }
+  .btn-ghost:hover { background: rgba(255,255,255,0.08); border-color: var(--accent); }
+  .seg-btn {
+    flex: 1;
+    padding: 8px 0;
+    border-radius: 8px;
+    font-weight: 600;
+    font-size: 13px;
+    border: 1px solid rgba(255,255,255,0.08);
+    background: transparent;
+    color: var(--text-1);
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .seg-btn.active {
+    background: linear-gradient(135deg, rgba(0,224,198,0.18), rgba(99,102,241,0.18));
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .checkbox-card {
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 10px;
+    padding: 10px 12px;
+    cursor: pointer;
+    transition: all 0.15s;
+    background: rgba(255,255,255,0.02);
+  }
+  .checkbox-card.checked {
+    border-color: var(--accent);
+    background: rgba(0,224,198,0.06);
+  }
+  .marquee-bg {
+    background-image:
+      linear-gradient(rgba(255,255,255,0.02) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,0.02) 1px, transparent 1px);
+    background-size: 40px 40px;
+  }
+  @keyframes pulse-soft { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+  .pulse-dot { animation: pulse-soft 2s infinite; }
+</style>
+</head>
+<body class="marquee-bg">
+
+<!-- ==================== 상단 툴바 ==================== -->
+<header class="sticky top-0 z-50 glass border-b border-white/5">
+  <div class="max-w-[1400px] mx-auto px-6 py-4 flex items-center gap-4">
+    <div class="flex items-center gap-3">
+      <div class="w-9 h-9 rounded-lg bg-gradient-to-br from-[#00e0c6] to-[#6366f1] flex items-center justify-center">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#06121a" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 17l6-6 4 4 8-8"/><path d="M14 7h7v7"/>
+        </svg>
+      </div>
+      <div>
+        <div class="text-base font-bold tracking-tight">DEMAND FORECAST <span class="text-[#00e0c6]">·</span> STUDIO</div>
+        <div class="text-[10px] text-[var(--text-2)] tracking-widest uppercase">시계열 수요예측 시스템</div>
+      </div>
+    </div>
+
+    <div class="flex-1 hidden md:flex items-center justify-center gap-2">
+      <span id="tb-status" class="chip"><span class="chip-dot bg-amber-400 pulse-dot"></span>데이터 없음</span>
+      <span id="tb-period" class="chip hidden"><span class="chip-dot bg-cyan-400"></span><span></span></span>
+      <span id="tb-models" class="chip hidden"><span class="chip-dot bg-fuchsia-400"></span><span></span></span>
+    </div>
+
+    <div class="flex items-center gap-2">
+      <button id="btn-upload" class="btn-ghost px-4 py-2 rounded-lg text-sm flex items-center gap-2">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+        엑셀 업로드
+      </button>
+      <input id="file-input" type="file" accept=".xlsx,.xls,.csv" class="hidden" />
+      <button id="btn-sample" class="btn-ghost px-3 py-2 rounded-lg text-sm">샘플</button>
+      <button id="btn-export" disabled class="btn-primary px-4 py-2 rounded-lg text-sm flex items-center gap-2">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+        Word 저장
+      </button>
+    </div>
+  </div>
+</header>
+
+<main class="max-w-[1400px] mx-auto px-6 py-6">
+
+<!-- ==================== 빈 상태 (랜딩) ==================== -->
+<section id="empty-state" class="py-20">
+  <div class="max-w-2xl mx-auto text-center">
+    <div class="inline-flex items-center gap-2 chip mb-6">
+      <span class="chip-dot bg-emerald-400"></span>
+      Powered by Time-Series Models
+    </div>
+    <h1 class="text-5xl md:text-6xl font-extrabold tracking-tight mb-4 leading-tight">
+      엑셀 한 장으로<br/>
+      <span class="bg-gradient-to-r from-[#00e0c6] via-[#6366f1] to-[#f472b6] bg-clip-text text-transparent">미래의 수요를</span>
+    </h1>
+    <p class="text-[var(--text-1)] text-lg mb-10">
+      월별 데이터를 업로드하면 5가지 시계열 모형으로 향후 수요를 예측하고<br/>
+      신뢰구간과 함께 인터랙티브 차트로 보여드립니다
+    </p>
+    <div id="dropzone" class="glass rounded-2xl border-dashed border-2 border-white/10 hover:border-[#00e0c6] transition-all p-12 cursor-pointer">
+      <div class="flex flex-col items-center gap-3">
+        <div class="w-16 h-16 rounded-full bg-gradient-to-br from-[#00e0c6]/20 to-[#6366f1]/20 flex items-center justify-center">
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#00e0c6" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+        </div>
+        <div class="font-semibold">파일을 드래그하거나 클릭해서 업로드</div>
+        <div class="text-xs text-[var(--text-2)]">.xlsx · .xls · .csv | 시트에 <span class="text-[#00e0c6]">연도</span>, <span class="text-[#00e0c6]">월</span> 컬럼이 있어야 합니다</div>
+      </div>
+    </div>
+    <div class="mt-6 text-sm text-[var(--text-2)]">
+      처음 사용해보시나요? <button id="btn-try-sample" class="text-[#00e0c6] underline underline-offset-2 hover:text-white">샘플 데이터로 체험하기</button>
+    </div>
+  </div>
+</section>
+
+<!-- ==================== 메인 대시보드 ==================== -->
+<section id="dashboard" class="hidden space-y-6">
+
+  <!-- 컨트롤 패널 -->
+  <div class="glass rounded-2xl p-5">
+    <div class="grid grid-cols-1 md:grid-cols-12 gap-4">
+      <!-- 데이터 선택 -->
+      <div class="md:col-span-3">
+        <div class="text-[10px] uppercase tracking-widest text-[var(--text-2)] mb-2 font-semibold">데이터</div>
+        <select id="sel-sheet" class="w-full bg-[var(--bg-2)] border border-white/10 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-[#00e0c6]"></select>
+        <select id="sel-column" class="w-full mt-2 bg-[var(--bg-2)] border border-white/10 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-[#00e0c6]"></select>
+        <div id="data-info" class="mt-2 text-[11px] text-[var(--text-2)] num"></div>
+      </div>
+
+      <!-- 예측 기간 -->
+      <div class="md:col-span-3">
+        <div class="text-[10px] uppercase tracking-widest text-[var(--text-2)] mb-2 font-semibold">예측 기간</div>
+        <div class="flex gap-1">
+          <button class="seg-btn active" data-period="3">3개월</button>
+          <button class="seg-btn" data-period="6">6개월</button>
+          <button class="seg-btn" data-period="12">12개월</button>
+          <button class="seg-btn" data-period="24">24개월</button>
+        </div>
+        <div class="mt-3">
+          <div class="flex items-center justify-between text-[10px] uppercase tracking-widest text-[var(--text-2)] mb-1">
+            <span class="font-semibold">출력 형태</span>
+          </div>
+          <div class="flex gap-1">
+            <button class="seg-btn active" data-output="point">점 예측</button>
+            <button class="seg-btn" data-output="interval">예상 범위</button>
+            <button class="seg-btn" data-output="both">둘 다</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 모형 선택 -->
+      <div class="md:col-span-4">
+        <div class="text-[10px] uppercase tracking-widest text-[var(--text-2)] mb-2 font-semibold">예측 모형 (다중 선택 가능)</div>
+        <div id="model-grid" class="grid grid-cols-2 gap-2"></div>
+      </div>
+
+      <!-- 신뢰수준 -->
+      <div class="md:col-span-2">
+        <div class="text-[10px] uppercase tracking-widest text-[var(--text-2)] mb-2 font-semibold">신뢰수준</div>
+        <div class="flex gap-1 mb-3">
+          <button class="seg-btn" data-ci="80">80%</button>
+          <button class="seg-btn active" data-ci="95">95%</button>
+        </div>
+        <div class="text-[10px] uppercase tracking-widest text-[var(--text-2)] mb-2 font-semibold">앙상블</div>
+        <label class="flex items-center gap-2 cursor-pointer">
+          <input id="chk-ensemble" type="checkbox" checked class="w-4 h-4 accent-[#00e0c6]" />
+          <span class="text-sm">앙상블 표시</span>
+        </label>
+      </div>
+    </div>
+
+    <!-- 고급 파라미터 -->
+    <details class="mt-4 border-t border-white/5 pt-3">
+      <summary class="text-xs text-[var(--text-1)] hover:text-[#00e0c6] flex items-center gap-2">
+        <svg id="adv-arrow" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" class="transition-transform">
+          <polyline points="9 18 15 12 9 6"/>
+        </svg>
+        고급 파라미터 조정
+      </summary>
+      <div class="mt-3 grid grid-cols-2 md:grid-cols-4 gap-4 text-xs">
+        <div>
+          <div class="flex justify-between mb-1"><span class="text-[var(--text-1)]">이동평균 윈도우</span><span class="num text-[#00e0c6]" id="lbl-ma">12</span></div>
+          <input id="param-ma" type="range" min="3" max="24" value="12" class="w-full" />
+        </div>
+        <div>
+          <div class="flex justify-between mb-1"><span class="text-[var(--text-1)]">지수평활 α</span><span class="num text-[#00e0c6]" id="lbl-alpha">0.30</span></div>
+          <input id="param-alpha" type="range" min="0.05" max="0.95" step="0.05" value="0.30" class="w-full" />
+        </div>
+        <div>
+          <div class="flex justify-between mb-1"><span class="text-[var(--text-1)]">Holt-Winters β (추세)</span><span class="num text-[#00e0c6]" id="lbl-beta">0.10</span></div>
+          <input id="param-beta" type="range" min="0.01" max="0.50" step="0.01" value="0.10" class="w-full" />
+        </div>
+        <div>
+          <div class="flex justify-between mb-1"><span class="text-[var(--text-1)]">Holt-Winters γ (계절)</span><span class="num text-[#00e0c6]" id="lbl-gamma">0.30</span></div>
+          <input id="param-gamma" type="range" min="0.05" max="0.95" step="0.05" value="0.30" class="w-full" />
+        </div>
+      </div>
+    </details>
+  </div>
+
+  <!-- KPI 카드 -->
+  <div id="kpi-grid" class="grid grid-cols-2 md:grid-cols-4 gap-3"></div>
+
+  <!-- 메인 차트 -->
+  <div class="glass rounded-2xl p-5">
+    <div class="flex flex-wrap items-center justify-between gap-3 mb-4">
+      <div>
+        <h3 class="text-lg font-bold">수요예측 차트</h3>
+        <div id="chart-subtitle" class="text-xs text-[var(--text-2)] mt-0.5"></div>
+      </div>
+      <div class="flex items-center gap-2 text-xs">
+        <button id="zoom-reset" class="btn-ghost px-3 py-1.5 rounded-md">전체 보기</button>
+        <button id="zoom-recent" class="btn-ghost px-3 py-1.5 rounded-md">최근 2년</button>
+        <button id="zoom-forecast" class="btn-ghost px-3 py-1.5 rounded-md">예측 구간 강조</button>
+      </div>
+    </div>
+    <div class="relative">
+      <svg id="chart-svg" class="w-full" style="height: 480px; cursor: crosshair;"></svg>
+      <div id="chart-tooltip" class="absolute pointer-events-none hidden glass rounded-lg px-3 py-2 text-xs shadow-2xl z-10 border-[#00e0c6]/40" style="border-width:1px;"></div>
+    </div>
+    <div id="chart-legend" class="mt-3 flex flex-wrap gap-3 justify-center text-xs"></div>
+  </div>
+
+  <!-- 모형 분석 패널 -->
+  <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+    <!-- 정확도 비교 -->
+    <div class="glass rounded-2xl p-5 lg:col-span-1">
+      <h3 class="text-sm font-bold uppercase tracking-widest mb-3">백테스트 정확도</h3>
+      <div id="accuracy-list" class="space-y-2.5"></div>
+      <div class="mt-4 pt-3 border-t border-white/5 text-[10px] text-[var(--text-2)] leading-relaxed">
+        MAPE(평균절대백분율오차)는 마지막 12개월을 hold-out하여 측정한 오차율입니다. <span class="text-[#00e0c6]">낮을수록 정확</span>합니다.
+      </div>
+    </div>
+
+    <!-- 모형별 해설 (동적 생성) -->
+    <div class="glass rounded-2xl p-5 lg:col-span-2">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-sm font-bold uppercase tracking-widest">모형별 분석 해설</h3>
+        <span class="text-[10px] text-[var(--text-2)]">선택한 모형 기준으로 자동 생성</span>
+      </div>
+      <div id="model-explain" class="space-y-3 max-h-[420px] overflow-y-auto pr-2 scrollbar-thin"></div>
+    </div>
+  </div>
+
+  <!-- 예측값 테이블 -->
+  <div class="glass rounded-2xl p-5">
+    <div class="flex items-center justify-between mb-3">
+      <h3 class="text-sm font-bold uppercase tracking-widest">예측값 상세</h3>
+      <span id="table-period-label" class="text-[10px] text-[var(--text-2)]"></span>
+    </div>
+    <div class="overflow-x-auto scrollbar-thin">
+      <table id="forecast-table" class="w-full text-xs num">
+        <thead></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- 종합 의견 -->
+  <div class="glass rounded-2xl p-5">
+    <h3 class="text-sm font-bold uppercase tracking-widest mb-3">종합 분석 의견</h3>
+    <div id="summary-opinion" class="text-sm text-[var(--text-1)] leading-relaxed space-y-2"></div>
+  </div>
+
+</section>
+
+<footer class="text-center text-[11px] text-[var(--text-2)] py-10 mt-10 border-t border-white/5">
+  데이터 출처: <a href="https://www.bandtrass.or.kr" target="_blank" class="text-[#00e0c6] hover:underline">BANDTrass 무역통계</a> ·
+  5종 시계열 모형 + 앙상블 · 100% 클라이언트 사이드 처리
+</footer>
+
+</main>
+
+<!-- 토스트 -->
+<div id="toast" class="fixed bottom-6 right-6 hidden glass rounded-lg px-4 py-3 text-sm shadow-2xl z-50"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
