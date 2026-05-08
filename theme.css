@@ -590,6 +590,17 @@ input[type=range]::-moz-range-thumb {
   color: var(--text-2);
   border-bottom: 1px solid var(--card-border);
 }
+.forecast-table thead tr.group-header th {
+  text-align: center;
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  padding-bottom: 6px;
+  background: var(--hover-bg);
+}
+.forecast-table thead tr.group-header th[rowspan] {
+  background: transparent;
+  text-align: left;
+}
 .forecast-table thead th:first-child { text-align: left; }
 .forecast-table tbody td {
   text-align: right; padding: 7px 12px;
@@ -685,9 +696,44 @@ input[type=range]::-moz-range-thumb {
 /* ============== 푸터 ============== */
 .footer {
   text-align: center;
-  font-size: 11px;
-  color: var(--text-2);
   padding: 30px 20px;
   margin-top: 30px;
   border-top: 1px solid var(--card-border);
+}
+.footer-credits {
+  display: flex; justify-content: center; align-items: center;
+  flex-wrap: wrap; gap: 14px;
+  margin-bottom: 10px;
+  padding-bottom: 12px;
+}
+.credit-item {
+  display: inline-flex; align-items: center; gap: 8px;
+  font-size: 12px;
+}
+.credit-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--text-2);
+  font-weight: 700;
+  padding: 3px 8px;
+  border-radius: 4px;
+  background: var(--hover-bg);
+  border: 1px solid var(--card-border);
+}
+.credit-value {
+  font-weight: 600;
+  color: var(--text-0);
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+.credit-sep {
+  color: var(--text-2);
+  font-size: 14px;
+}
+.footer-meta {
+  font-size: 11px;
+  color: var(--text-2);
 }

@@ -1382,44 +1382,81 @@ function renderForecastTable() {
   const refItem = items[0];
   const labels = refItem.futureLabels;
 
-  // 헤더: 월 + (시리즈별로 모형들)
-  const cols = [];
-  items.forEach(item => {
+  // 시리즈별 짧은 라벨 (수.금 / 수.건 / 출.금 / 출.건 - 명확한 구분)
+  const shortLabel = (item) => {
+    const dirChar = item.direction === 'import' ? '수입' : '수출';
+    const metChar = item.metric === 'amount' ? '금액' : '건수';
+    return `${dirChar}·${metChar}`;
+  };
+
+  // 시리즈별로 모형 컬럼 그룹화
+  const groups = items.map(item => {
+    const cols = [];
     STATE.selectedModels.forEach(k => {
       if (!MODELS[k] || !MODELS[k].enabled) return;
       if (!item.predictions[k]) return;
       cols.push({
-        item, key: k, label: `${item.label.split(' ')[0][0]}.${MODELS[k].short}`,
-        full: `${item.label} (${MODELS[k].name})`,
+        item, key: k,
+        label: MODELS[k].short,
+        full: `${item.label} - ${MODELS[k].name}`,
         color: MODELS[k].color, unit: item.unit,
       });
     });
     if (item.predictions.ensemble) {
       cols.push({
-        item, key: 'ensemble', label: `${item.label.split(' ')[0][0]}.ENS`,
-        full: `${item.label} (앙상블)`,
+        item, key: 'ensemble',
+        label: '앙상블',
+        full: `${item.label} - 앙상블`,
         color: item.color, unit: item.unit, isEnsemble: true,
       });
     }
+    return { item, cols, shortLabel: shortLabel(item) };
   });
 
-  let html = '<thead><tr><th>월</th>';
-  cols.forEach(c => {
-    html += `<th title="${c.full}" style="color:${c.color}">${c.label}</th>`;
+  const allCols = groups.flatMap(g => g.cols);
+
+  // 그룹 헤더 (시리즈명) - 항상 표시 (단일 시리즈여도 명확하게)
+  let html = '<thead>';
+  html += '<tr class="group-header"><th rowspan="2" style="vertical-align:bottom;">월</th>';
+  groups.forEach((g, gi) => {
+    const isLast = gi === groups.length - 1;
+    const borderRight = isLast ? '' : 'border-right:2px solid var(--line-strong);';
+    html += `<th colspan="${g.cols.length}" style="color:${g.item.color};background:color-mix(in srgb, ${g.item.color} 12%, transparent);border-bottom:2px solid ${g.item.color};${borderRight}padding:8px 12px;font-weight:700;font-size:11px;letter-spacing:0.05em;" title="${g.item.label}">▌${g.shortLabel}</th>`;
+  });
+  html += '</tr><tr>';
+
+  let groupColIdx = 0;
+  groups.forEach((g, gi) => {
+    const isLastGroup = gi === groups.length - 1;
+    g.cols.forEach((c, ci) => {
+      const isLastInGroup = ci === g.cols.length - 1;
+      const borderRight = (!isLastGroup && isLastInGroup) ? 'border-right:2px solid var(--line-strong);' : '';
+      html += `<th title="${c.full}" style="color:${c.color};${borderRight}">${c.label}</th>`;
+      groupColIdx++;
+    });
   });
   html += '</tr></thead><tbody>';
 
   labels.forEach((lbl, i) => {
     html += `<tr><td>${lbl.date}</td>`;
-    cols.forEach(c => {
-      const v = c.item.predictions[c.key][i];
-      const intv = c.item.intervals[c.key][i];
-      let cell = formatValue(v, c.unit);
-      if (STATE.output !== 'point') {
-        cell += `<div class="tbl-interval">[${formatValue(intv.lower, c.unit)} ~ ${formatValue(intv.upper, c.unit)}]</div>`;
-      }
-      const style = c.isEnsemble ? `color:${c.color};font-weight:700` : `color:${c.color}`;
-      html += `<td style="${style}">${cell}</td>`;
+    let colIdx = 0;
+    groups.forEach((g, gi) => {
+      const isLastGroup = gi === groups.length - 1;
+      g.cols.forEach((c, ci) => {
+        const isLastInGroup = ci === g.cols.length - 1;
+        const borderRight = (!isLastGroup && isLastInGroup) ? 'border-right:2px solid var(--line-strong);' : '';
+        const v = c.item.predictions[c.key][i];
+        const intv = c.item.intervals[c.key][i];
+        let cell = formatValue(v, c.unit);
+        if (STATE.output !== 'point') {
+          cell += `<div class="tbl-interval">[${formatValue(intv.lower, c.unit)} ~ ${formatValue(intv.upper, c.unit)}]</div>`;
+        }
+        const style = c.isEnsemble
+          ? `color:${c.color};font-weight:700;${borderRight}`
+          : `color:${c.color};${borderRight}`;
+        html += `<td style="${style}">${cell}</td>`;
+        colIdx++;
+      });
     });
     html += '</tr>';
   });
@@ -1785,9 +1822,19 @@ async function exportWord() {
   if (STATE.output !== 'point') children.push(bullet(`${STATE.ciLevel}% 신뢰구간이 함께 산출되었습니다. 의사결정 시 상한·하한 시나리오를 모두 고려하시기 바랍니다.`));
 
   children.push(new Paragraph({
-    spacing: { before: 600, after: 100 },
+    spacing: { before: 600, after: 80 },
     border: { top: { style: BorderStyle.SINGLE, size: 6, color: "CBD5E1", space: 6 } },
-    children: [new TextRun({ text: '본 보고서는 Demand Forecast Studio v2에 의해 자동 생성되었습니다. 데이터 출처: BANDTrass 무역통계.', size: 18, color: "64748B", italics: true, font: "맑은 고딕" })],
+    alignment: AlignmentType.CENTER,
+    children: [
+      new TextRun({ text: '프로그램 관리자: ', size: 18, color: "64748B", font: "맑은 고딕" }),
+      new TextRun({ text: 'James Jeong', size: 18, color: "0891B2", bold: true, font: "맑은 고딕" }),
+      new TextRun({ text: '   ·   프로그램 개발환경: ', size: 18, color: "64748B", font: "맑은 고딕" }),
+      new TextRun({ text: 'Claude', size: 18, color: "0891B2", bold: true, font: "맑은 고딕" }),
+    ],
+  }));
+  children.push(new Paragraph({
+    alignment: AlignmentType.CENTER,
+    children: [new TextRun({ text: '본 보고서는 Demand Forecast Studio v2에 의해 자동 생성되었습니다. 데이터 출처: BANDTrass 무역통계.', size: 16, color: "94A3B8", italics: true, font: "맑은 고딕" })],
   }));
 
   const doc = new Document({
