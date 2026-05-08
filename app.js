@@ -14,7 +14,7 @@ const STATE = {
   direction: 'both',      // 'import' | 'export' | 'both'
   metric: 'amount',       // 'amount' | 'count' | 'both'
   scope: 'ec',            // 'ec' | 'total'
-  currency: 'KRW',        // 'KRW' | 'USD'
+  currency: 'USD',        // 'KRW' | 'USD' (원본 데이터는 USD 기준)
   theme: 'dark',
   // 예측 옵션
   selectedModels: ['hw'],
@@ -767,20 +767,24 @@ function formatValue(n, unit) {
   if (unit === 'count') return formatCount(n);
   return formatMoney(n);
 }
+// 원본 데이터의 통화 단위는 USD(미달러)입니다.
+// BANDTrass 무역통계는 USD 기준으로 제공됨.
+// STATE.currency는 "표시 단위 선택"으로, KRW 선택 시 환율을 곱해 원화로 환산합니다.
 function formatMoney(n) {
-  // KRW 또는 USD
   const cur = STATE.currency;
-  if (cur === 'USD') {
-    n = n / STATE.usdRate;
+  if (cur === 'KRW') {
+    // 원본 USD → KRW로 환산 표시
+    n = n * STATE.usdRate;
+    if (Math.abs(n) >= 1e12) return (n / 1e12).toFixed(2) + '조원';
+    if (Math.abs(n) >= 1e8) return (n / 1e8).toFixed(2) + '억원';
+    if (Math.abs(n) >= 1e4) return (n / 1e4).toFixed(1) + '만원';
+    return Math.round(n).toLocaleString() + '원';
+  } else {
+    // 원본이 이미 USD이므로 변환 없이 표시
     if (Math.abs(n) >= 1e9) return '$' + (n / 1e9).toFixed(2) + 'B';
     if (Math.abs(n) >= 1e6) return '$' + (n / 1e6).toFixed(2) + 'M';
     if (Math.abs(n) >= 1e3) return '$' + (n / 1e3).toFixed(1) + 'K';
     return '$' + Math.round(n).toLocaleString();
-  } else {
-    if (Math.abs(n) >= 1e12) return (n / 1e12).toFixed(2) + '조';
-    if (Math.abs(n) >= 1e8) return (n / 1e8).toFixed(2) + '억';
-    if (Math.abs(n) >= 1e4) return (n / 1e4).toFixed(1) + '만';
-    return Math.round(n).toLocaleString() + '원';
   }
 }
 function formatCount(n) {
@@ -1423,7 +1427,7 @@ function renderForecastTable() {
   tbl.innerHTML = html;
 
   document.getElementById('table-period-label').textContent =
-    `${labels[0].date} ~ ${labels[labels.length - 1].date} · 신뢰수준 ${STATE.ciLevel}% · 통화 ${STATE.currency}`;
+    `${labels[0].date} ~ ${labels[labels.length - 1].date} · 신뢰수준 ${STATE.ciLevel}% · 통화 ${STATE.currency}${STATE.currency === 'KRW' ? ` (1$ = ${STATE.usdRate}원 환산)` : ' (원본 단위)'}`;
 }
 
 function renderSummaryOpinion() {
@@ -1699,7 +1703,7 @@ async function exportWord() {
     }),
     new Paragraph({
       alignment: AlignmentType.CENTER,
-      children: [new TextRun({ text: `생성일: ${today} · 통화: ${STATE.currency} · 예측기간: ${periodLabel}`, size: 22, color: "64748B", font: "맑은 고딕" })],
+      children: [new TextRun({ text: `생성일: ${today} · 통화: ${STATE.currency}${STATE.currency === 'KRW' ? ` (1$=${STATE.usdRate}원 환산)` : ' (원본 USD)'} · 예측기간: ${periodLabel}`, size: 22, color: "64748B", font: "맑은 고딕" })],
     }),
     new Paragraph({ children: [new PageBreak()] }),
 
