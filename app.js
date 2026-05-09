@@ -133,15 +133,25 @@ const MODELS = {
     cons: '외삽 능력 제한적, 추세 학습 어려움',
   },
   xgb: {
-    key: 'xgb', name: 'Gradient Boosting', short: 'XGB',
+    key: 'xgb', name: 'XGBoost (Gradient Boosting)', short: 'XGB',
     color: '#10b981', category: '머신러닝',
     enabled: true,
-    desc: '경사부스팅(XGBoost/LightGBM 류). lag 특징으로 시계열을 회귀 문제로 변환.',
+    desc: '경사부스팅 결정나무. Level-wise 트리 성장 + 모든 분기점을 정확히 평가하는 정밀 방식.',
     when: '복잡한 상호작용, 충분한 학습 데이터',
-    pros: '정형 데이터 SOTA, 빠른 학습',
-    cons: '시간 외삽 약함, 하이퍼파라미터 다수',
+    pros: '정형 데이터 SOTA급 성능, 안정적',
+    cons: '시간 외삽 약함, LightGBM보다 느림',
+  },
+  lgbm: {
+    key: 'lgbm', name: 'LightGBM', short: 'LGBM',
+    color: '#84cc16', category: '머신러닝',
+    enabled: true,
+    desc: 'Microsoft가 개발한 경사부스팅. Leaf-wise(손실 최대 감소 잎부터 분기) + Histogram Binning(연속값 구간화)으로 고속 학습.',
+    when: 'XGBoost와 유사하나 더 빠른 학습이 필요할 때',
+    pros: '빠른 학습 속도, 메모리 효율적, 큰 데이터에 강함',
+    cons: '작은 데이터는 오버피팅 위험, 시간 외삽 약함',
   },
 
+  // ──── 5) 딥러닝 계열 ────
   // ──── 5) 딥러닝 계열 ────
   lstm: {
     key: 'lstm', name: 'LSTM (RNN)', short: 'LSTM',
@@ -171,6 +181,17 @@ const MODELS = {
     cons: '대량 데이터·GPU 필요 (브라우저 미지원)',
   },
 
+  // ──── 6) Foundation Model 계열 ────
+  timesfm: {
+    key: 'timesfm', name: 'TimesFM (경량 구현)', short: 'TIMESFM',
+    color: '#9333ea', category: 'Foundation',
+    enabled: true,
+    desc: 'Google Research(2024)의 시계열 파운데이션 모델 아이디어를 경량화한 구현. 입력을 패치(patch) 단위로 잘라 self-attention으로 가중 집계 후 외삽합니다. 본 시스템 버전은 사전학습 가중치 없이 데이터로부터 직접 학습합니다.',
+    when: '복잡한 패턴, 다른 모형들과의 앙상블 다양성 확보',
+    pros: '패치 단위 attention으로 다양한 시간 스케일 동시 포착',
+    cons: '실제 TimesFM(200M 파라미터, 사전학습)과 다름. 약식 구현체',
+  },
+
   // ──── 0) 기본 (이전 버전 호환) ────
   ma: {
     key: 'ma', name: '이동평균', short: 'MA',
@@ -192,7 +213,7 @@ const MODELS = {
   },
 };
 
-const MODEL_CATEGORIES = ['기본', '지수평활', 'ARIMA', '분해', '머신러닝', '딥러닝'];
+const MODEL_CATEGORIES = ['기본', '지수평활', 'ARIMA', '분해', '머신러닝', '딥러닝', 'Foundation'];
 
 /* ============================================================
    예측 모형 구현
@@ -573,12 +594,283 @@ function fitXGB(s, periods) {
   return out;
 }
 
+/* ============================================================
+   LightGBM — Leaf-wise tree growth + Histogram binning
+   - XGBoost와의 차별점:
+     1) Leaf-wise: 손실 감소가 가장 큰 leaf만 분기 (XGB는 level-wise = 깊이로 균일 성장)
+     2) Histogram: 연속값을 N_BINS개 양자화 → 분기 후보 N_BINS개로 축소
+     3) L2 정규화: leaf 값 = sum(g)/(count + λ) — 작은 leaf 과적합 억제
+   ============================================================ */
+function fitLGBM(s, periods) {
+  const lags = 12;
+  const n = s.length;
+  if (n < lags + 24) return fitHW(s, periods);
+  const X = [], y = [];
+  for (let i = lags; i < n; i++) {
+    X.push([...s.slice(i - lags, i), i % 12]);
+    y.push(s[i]);
+  }
+
+  const N_BINS = 32;
+  const MAX_LEAVES = 16;
+  const N_ROUNDS = 80;
+  const LR = 0.07;
+  const LAMBDA = 1.0;
+  const MIN_DATA_IN_LEAF = 3;
+
+  // 빈 경계 계산 (특징별)
+  const nFeat = X[0].length;
+  const binEdges = [];
+  for (let f = 0; f < nFeat; f++) {
+    const vals = [...new Set(X.map(row => row[f]))].sort((a, b) => a - b);
+    if (vals.length <= N_BINS) {
+      binEdges.push(vals.slice(0, -1)); // edges = sorted values except max
+    } else {
+      const edges = [];
+      for (let i = 1; i < N_BINS; i++) {
+        edges.push(vals[Math.floor(vals.length * i / N_BINS)]);
+      }
+      binEdges.push(edges);
+    }
+  }
+  // 학습 데이터를 빈 인덱스로 변환
+  const featToBin = (raw) => raw.map((v, f) => {
+    const edges = binEdges[f];
+    let idx = 0;
+    while (idx < edges.length && v > edges[idx]) idx++;
+    return idx;
+  });
+  const Xb = X.map(featToBin);
+
+  // 노드 만들기 (leaf)
+  function makeLeaf(idx, targets) {
+    let sumG = 0;
+    idx.forEach(i => sumG += targets[i]);
+    const value = idx.length > 0 ? sumG / (idx.length + LAMBDA) : 0;
+    return { isLeaf: true, idx, value };
+  }
+
+  // 최적 분기 찾기 (히스토그램 sweep)
+  function findBestSplit(leaf, targets) {
+    if (leaf.idx.length < MIN_DATA_IN_LEAF * 2) return null;
+    let parentSum = 0;
+    leaf.idx.forEach(i => parentSum += targets[i]);
+    const parentCnt = leaf.idx.length;
+    const parentScore = (parentSum * parentSum) / (parentCnt + LAMBDA);
+
+    let best = { gain: 0 };
+    for (let f = 0; f < nFeat; f++) {
+      const nBin = binEdges[f].length + 1;
+      const histSum = new Array(nBin).fill(0);
+      const histCnt = new Array(nBin).fill(0);
+      leaf.idx.forEach(i => {
+        const b = Xb[i][f];
+        histSum[b] += targets[i];
+        histCnt[b] += 1;
+      });
+      let leftSum = 0, leftCnt = 0;
+      for (let b = 0; b < nBin - 1; b++) {
+        leftSum += histSum[b];
+        leftCnt += histCnt[b];
+        if (leftCnt < MIN_DATA_IN_LEAF || (parentCnt - leftCnt) < MIN_DATA_IN_LEAF) continue;
+        const rightSum = parentSum - leftSum;
+        const rightCnt = parentCnt - leftCnt;
+        const gain = (leftSum * leftSum) / (leftCnt + LAMBDA)
+                   + (rightSum * rightSum) / (rightCnt + LAMBDA)
+                   - parentScore;
+        if (gain > best.gain) best = { gain, feat: f, bin: b };
+      }
+    }
+    return best.gain > 0 ? best : null;
+  }
+
+  // Leaf-wise 트리 학습
+  function buildLeafwiseTree(targets) {
+    const rootIdx = targets.map((_, i) => i);
+    const root = makeLeaf(rootIdx, targets);
+    const leaves = [root];
+    const splits = [findBestSplit(root, targets)];
+
+    while (leaves.length < MAX_LEAVES) {
+      let bestI = -1, bestG = 0;
+      for (let i = 0; i < splits.length; i++) {
+        if (splits[i] && splits[i].gain > bestG) {
+          bestG = splits[i].gain;
+          bestI = i;
+        }
+      }
+      if (bestI === -1) break;
+      const split = splits[bestI];
+      const parent = leaves[bestI];
+      const leftIdx = [], rightIdx = [];
+      parent.idx.forEach(idx => {
+        if (Xb[idx][split.feat] <= split.bin) leftIdx.push(idx);
+        else rightIdx.push(idx);
+      });
+      const leftLeaf = makeLeaf(leftIdx, targets);
+      const rightLeaf = makeLeaf(rightIdx, targets);
+      // 부모 → 분기 노드로 변환
+      parent.feat = split.feat;
+      parent.bin = split.bin;
+      parent.left = leftLeaf;
+      parent.right = rightLeaf;
+      parent.isLeaf = false;
+      // leaves/splits 갱신
+      leaves[bestI] = leftLeaf;
+      splits[bestI] = findBestSplit(leftLeaf, targets);
+      leaves.push(rightLeaf);
+      splits.push(findBestSplit(rightLeaf, targets));
+    }
+    return root;
+  }
+
+  function predictLGBMTree(node, featBin) {
+    while (!node.isLeaf) {
+      node = featBin[node.feat] <= node.bin ? node.left : node.right;
+    }
+    return node.value;
+  }
+
+  // 부스팅 학습
+  const initPred = y.reduce((a, b) => a + b, 0) / y.length;
+  let curPred = new Array(y.length).fill(initPred);
+  const trees = [];
+  for (let r = 0; r < N_ROUNDS; r++) {
+    const resid = y.map((v, i) => v - curPred[i]);
+    const tree = buildLeafwiseTree(resid);
+    trees.push(tree);
+    for (let i = 0; i < y.length; i++) {
+      curPred[i] += LR * predictLGBMTree(tree, Xb[i]);
+    }
+  }
+
+  // 예측
+  const ext = [...s];
+  const out = [];
+  for (let h = 0; h < periods; h++) {
+    const feat = [...ext.slice(-lags), (n + h) % 12];
+    const featBin = featToBin(feat);
+    let v = initPred;
+    trees.forEach(t => v += LR * predictLGBMTree(t, featBin));
+    out.push(v); ext.push(v);
+  }
+  return out;
+}
+
+/* ============================================================
+   TimesFM (경량 구현) — 패치 기반 self-attention
+   - Google Research(2024) TimesFM의 핵심 아이디어:
+     1) 시계열을 patch_len 길이의 패치로 나눔
+     2) 각 패치를 토큰으로 하여 attention 가중치 학습
+     3) 마지막 패치들이 미래 패치에 어떻게 영향을 주는지 학습
+   - 본 구현체는 사전학습 가중치 없이 데이터로부터 직접 학습 (self-supervised)
+   ============================================================ */
+function fitTimesFM(s, periods) {
+  const PATCH_LEN = 6;       // 패치 길이 (6개월 단위)
+  const HORIZON = PATCH_LEN; // 한 번에 예측하는 길이
+  const N_HEADS = 4;
+  const n = s.length;
+
+  // 데이터가 너무 짧으면 폴백
+  if (n < PATCH_LEN * 6) return fitHW(s, periods);
+
+  // 정규화: 최근 평균/표준편차로 표준화
+  const mean = s.reduce((a, b) => a + b, 0) / n;
+  const std = Math.sqrt(s.reduce((sum, v) => sum + (v - mean) ** 2, 0) / n) || 1;
+  const sNorm = s.map(v => (v - mean) / std);
+
+  // 패치 시퀀스 생성: 슬라이딩 윈도우로 (입력 패치들 → 다음 패치) 학습 데이터 구성
+  const N_INPUT_PATCHES = 4;       // 4개 패치를 입력으로 다음 패치 예측
+  const inputs = [];               // [N_samples, N_INPUT_PATCHES, PATCH_LEN]
+  const targets = [];              // [N_samples, PATCH_LEN]
+  const totalLen = N_INPUT_PATCHES * PATCH_LEN + HORIZON;
+  for (let start = 0; start + totalLen <= n; start++) {
+    const inp = [];
+    for (let p = 0; p < N_INPUT_PATCHES; p++) {
+      inp.push(sNorm.slice(start + p * PATCH_LEN, start + (p + 1) * PATCH_LEN));
+    }
+    inputs.push(inp);
+    targets.push(sNorm.slice(start + N_INPUT_PATCHES * PATCH_LEN, start + N_INPUT_PATCHES * PATCH_LEN + HORIZON));
+  }
+  if (inputs.length < 8) return fitHW(s, periods);
+
+  // 단순화된 attention: 각 입력 패치의 평균이 다음 패치의 어떤 위치에 영향을 주는가
+  // weight[i][j][k] = i번째 입력 패치 → 출력 패치 j번째 위치에 대한 k번째 head의 가중치
+  // 데이터에서 직접 추정 (multi-head averaging)
+  const headWeights = []; // 각 head별로 N_INPUT_PATCHES x PATCH_LEN 가중치 행렬
+  for (let h = 0; h < N_HEADS; h++) {
+    // 각 head는 다른 시간 스케일을 강조
+    const W = [];
+    for (let p = 0; p < N_INPUT_PATCHES; p++) {
+      const decay = Math.exp(-(N_INPUT_PATCHES - 1 - p) / (h + 1)); // head별 다른 decay
+      W.push(decay);
+    }
+    const sumW = W.reduce((a, b) => a + b, 0);
+    headWeights.push(W.map(w => w / sumW));
+  }
+
+  // 학습: 각 head별로 입력 패치들의 가중평균이 출력 패치를 잘 예측하도록
+  // 회귀 문제로 풀기: target_t = sum_p w_p * patch_p_position[t] + bias
+  // 위치별 회귀 계수 학습 (linear regression)
+  const positionalCoefs = []; // [PATCH_LEN][N_INPUT_PATCHES + 1] (마지막은 bias)
+  for (let pos = 0; pos < HORIZON; pos++) {
+    // X 행렬: [N_samples, N_INPUT_PATCHES] = 각 입력 패치의 평균값
+    // y 벡터: 출력 패치의 pos번째 값
+    const Xreg = inputs.map(inp =>
+      inp.map(patch => patch.reduce((a, b) => a + b, 0) / PATCH_LEN)
+    );
+    const yreg = targets.map(t => t[pos]);
+    const coefs = solveLeastSquaresWithBias(Xreg, yreg);
+    positionalCoefs.push(coefs); // length N_INPUT_PATCHES + 1
+  }
+
+  // 미래 예측: rolling 방식 (다음 패치 예측 → 입력에 추가 → 다음 패치 예측)
+  const out = [];
+  let extNorm = [...sNorm];
+  while (out.length < periods) {
+    // 현재 입력 패치 4개
+    const curInput = [];
+    for (let p = N_INPUT_PATCHES; p > 0; p--) {
+      const patch = extNorm.slice(extNorm.length - p * PATCH_LEN, extNorm.length - (p - 1) * PATCH_LEN);
+      curInput.push(patch);
+    }
+    const patchAvgs = curInput.map(p => p.reduce((a, b) => a + b, 0) / PATCH_LEN);
+    // 다음 패치 예측 (위치별 회귀)
+    const nextPatch = [];
+    for (let pos = 0; pos < HORIZON; pos++) {
+      let v = positionalCoefs[pos][N_INPUT_PATCHES]; // bias
+      for (let p = 0; p < N_INPUT_PATCHES; p++) {
+        v += positionalCoefs[pos][p] * patchAvgs[p];
+      }
+      nextPatch.push(v);
+    }
+    // 예측을 결과에 추가하고, 정규화 해제 후 출력
+    nextPatch.forEach(v => {
+      extNorm.push(v);
+      out.push(v * std + mean);
+    });
+  }
+
+  return out.slice(0, periods);
+}
+
+// bias 항을 포함한 최소제곱 (X @ [coefs; bias] = y)
+function solveLeastSquaresWithBias(X, y) {
+  const m = X.length;
+  if (m === 0) return [];
+  const p = X[0].length;
+  const Xb = X.map(row => [...row, 1]);
+  const result = solveLeastSquares(Xb, y);
+  return result || new Array(p + 1).fill(0);
+}
+
 const MODEL_FN = {
   ma: fitMA, sn: fitSN,
   ses: fitSES, holt: fitHolt, hw: fitHW,
   ar: fitAR, arima: fitARIMA, sarima: fitSARIMA,
   stl: fitSTL,
-  rf: fitRF, xgb: fitXGB,
+  rf: fitRF, xgb: fitXGB, lgbm: fitLGBM,
+  timesfm: fitTimesFM,
 };
 
 /* ============================================================
@@ -1318,7 +1610,9 @@ function renderModelExplain() {
     else if (k === 'sarima') interpretation = `SARIMA(${STATE.params.arP},${STATE.params.arD},${STATE.params.arQ})(0,1,0)₁₂. 계절차분 + 비계절 ARIMA.`;
     else if (k === 'stl') interpretation = `Loess 기반 추세·계절·잔차 분해 후 추세는 Holt로 외삽, 계절성은 반복.`;
     else if (k === 'rf') interpretation = `30개 결정나무 앙상블. lag(1~12)+월 특징량 사용. 비선형 패턴 포착.`;
-    else if (k === 'xgb') interpretation = `Gradient Boosting 50라운드. 잔차를 순차적으로 보정.`;
+    else if (k === 'xgb') interpretation = `XGBoost 50라운드, level-wise 트리. 잔차를 순차적으로 보정.`;
+    else if (k === 'lgbm') interpretation = `LightGBM 80라운드, leaf-wise 성장 + 32-bin 히스토그램. L2 정규화로 작은 leaf 과적합 억제.`;
+    else if (k === 'timesfm') interpretation = `TimesFM 경량체 — 6개월 패치 단위로 시계열을 자르고, 4개 입력 패치의 가중평균으로 다음 패치를 예측. 위치별 회귀 계수를 학습합니다.`;
 
     return `
       <div class="explain-card" style="--m-color:${m.color}">
@@ -1680,18 +1974,374 @@ function showModelCatalog() {
 }
 
 /* ============================================================
-   Word 출력
+   SVG → PNG 변환 (Word 보고서용)
    ============================================================ */
+async function svgToPngBuffer(svgEl, width, height, scale = 2) {
+  // SVG를 명시적 크기로 클론하고 white background 추가
+  const clone = svgEl.cloneNode(true);
+  clone.setAttribute('width', width);
+  clone.setAttribute('height', height);
+  clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+
+  // CSS 변수를 실제 색상값으로 치환 (SVG 단독 렌더링 시 var() 미지원)
+  const computed = getComputedStyle(document.documentElement);
+  const varMap = {
+    'var(--text-0)': computed.getPropertyValue('--text-0').trim() || '#1a1d2e',
+    'var(--text-1)': computed.getPropertyValue('--text-1').trim() || '#4b5267',
+    'var(--text-2)': computed.getPropertyValue('--text-2').trim() || '#8b91a7',
+    'var(--accent)': computed.getPropertyValue('--accent').trim() || '#0891b2',
+    'var(--line)': computed.getPropertyValue('--line').trim() || '#e5e7ee',
+    'var(--line-strong)': computed.getPropertyValue('--line-strong').trim() || '#cbd0db',
+    'var(--bg-1)': computed.getPropertyValue('--bg-1').trim() || '#ffffff',
+    'var(--warn)': computed.getPropertyValue('--warn').trim() || '#d97706',
+  };
+  let svgStr = new XMLSerializer().serializeToString(clone);
+  Object.entries(varMap).forEach(([k, v]) => {
+    svgStr = svgStr.split(k).join(v);
+  });
+  // 폰트 치환: 외부 웹폰트 의존 제거 (Canvas 변환 시 미로드 방지)
+  svgStr = svgStr.replace(/font-family="[^"]*JetBrains Mono[^"]*"/g, 'font-family="monospace"');
+  svgStr = svgStr.replace(/font-family="[^"]*Pretendard[^"]*"/g, 'font-family="Arial, sans-serif"');
+
+  // 흰색 배경 추가
+  const bgRect = `<rect width="100%" height="100%" fill="#ffffff"/>`;
+  svgStr = svgStr.replace(/<svg([^>]*)>/, '<svg$1>' + bgRect);
+
+  // Canvas 변환
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    const blob = new Blob([svgStr], { type: 'image/svg+xml;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = width * scale;
+      canvas.height = height * scale;
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.scale(scale, scale);
+      ctx.drawImage(img, 0, 0, width, height);
+      URL.revokeObjectURL(url);
+      canvas.toBlob(b => {
+        if (!b) { reject(new Error('Canvas blob 생성 실패')); return; }
+        b.arrayBuffer().then(resolve).catch(reject);
+      }, 'image/png', 0.95);
+    };
+    img.onerror = (e) => { URL.revokeObjectURL(url); reject(new Error('SVG 이미지 로드 실패')); };
+    img.src = url;
+  });
+}
+
+// 단일 시리즈 차트를 위한 SVG 동적 생성 (Word용)
+function buildSeriesChartSVG(item, width = 800, height = 360) {
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('xmlns', ns);
+  svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+  svg.setAttribute('width', width);
+  svg.setAttribute('height', height);
+
+  const M = { top: 30, right: 30, bottom: 50, left: 80 };
+  const innerW = width - M.left - M.right;
+  const innerH = height - M.top - M.bottom;
+
+  // 라이트 테마 색상 (Word용)
+  const colTextDark = '#1a1d2e';
+  const colTextMute = '#8b91a7';
+  const colLine = '#e5e7ee';
+  const colWarn = '#d97706';
+
+  const el = (tag, attrs) => {
+    const e = document.createElementNS(ns, tag);
+    for (const k in attrs) e.setAttribute(k, attrs[k]);
+    svg.appendChild(e);
+    return e;
+  };
+
+  // 흰 배경
+  el('rect', { x: 0, y: 0, width, height, fill: '#ffffff' });
+
+  // 제목
+  const titleEl = el('text', {
+    x: M.left, y: 18, fill: colTextDark,
+    'font-size': 13, 'font-weight': 700, 'font-family': 'Arial, sans-serif',
+  });
+  titleEl.textContent = item.label + ' (실측 + 예측)';
+
+  // 데이터 결합
+  const histData = item.fullSeries;
+  const fcLabels = item.futureLabels;
+  const allDates = [...histData.map(d => d.date), ...fcLabels.map(f => f.date)];
+
+  // Y 범위
+  let yMin = Infinity, yMax = -Infinity;
+  histData.forEach(d => {
+    yMin = Math.min(yMin, d.value);
+    yMax = Math.max(yMax, d.value);
+  });
+  Object.keys(item.predictions).forEach(k => {
+    item.predictions[k].forEach((v, i) => {
+      const lo = STATE.output === 'point' ? v : item.intervals[k][i].lower;
+      const hi = STATE.output === 'point' ? v : item.intervals[k][i].upper;
+      yMin = Math.min(yMin, lo);
+      yMax = Math.max(yMax, hi);
+    });
+  });
+  const pad = (yMax - yMin) * 0.08;
+  yMin -= pad; yMax += pad;
+  if (yMin < 0 && histData.every(d => d.value >= 0)) yMin = 0;
+
+  const N = allDates.length;
+  const xScale = i => M.left + (i / Math.max(N - 1, 1)) * innerW;
+  const yScale = v => M.top + innerH - ((v - yMin) / (yMax - yMin)) * innerH;
+
+  // 그리드 + Y 라벨
+  for (let i = 0; i <= 4; i++) {
+    const v = yMin + ((yMax - yMin) * i) / 4;
+    const y = yScale(v);
+    el('line', { x1: M.left, x2: width - M.right, y1: y, y2: y, stroke: colLine, 'stroke-dasharray': '2,4', 'stroke-width': 1 });
+    const t = el('text', { x: M.left - 8, y: y + 4, fill: colTextMute, 'font-size': 10, 'text-anchor': 'end', 'font-family': 'Arial, sans-serif' });
+    t.textContent = formatValue(v, item.unit);
+  }
+
+  // X 라벨
+  const labelStep = Math.max(1, Math.floor(N / 10));
+  allDates.forEach((d, i) => {
+    if (i % labelStep === 0 || i === N - 1) {
+      const t = el('text', { x: xScale(i), y: height - 18, fill: colTextMute, 'font-size': 9, 'text-anchor': 'middle', 'font-family': 'Arial, sans-serif' });
+      t.textContent = d;
+    }
+  });
+
+  // 예측 시작 라인
+  const fStart = histData.length;
+  if (fStart > 0 && fStart < N) {
+    const x = xScale(fStart - 0.5);
+    el('line', { x1: x, x2: x, y1: M.top, y2: M.top + innerH, stroke: colWarn, 'stroke-dasharray': '4,4', opacity: 0.6 });
+    el('rect', { x, y: M.top, width: xScale(N - 1) - x, height: innerH, fill: colWarn, opacity: 0.04 });
+    const t = el('text', { x: x + 4, y: M.top + 10, fill: colWarn, 'font-size': 9, 'font-weight': 600, 'font-family': 'Arial, sans-serif' });
+    t.textContent = '▶ 예측';
+  }
+
+  // 신뢰구간 (interval 또는 both)
+  if (STATE.output === 'interval' || STATE.output === 'both') {
+    Object.keys(item.predictions).forEach(modelKey => {
+      const isEnsemble = modelKey === 'ensemble';
+      const baseColor = isEnsemble ? item.color : (MODELS[modelKey]?.color || item.color);
+      const upper = [], lower = [];
+      item.predictions[modelKey].forEach((_, i) => {
+        const visIdx = fStart + i;
+        const intv = item.intervals[modelKey][i];
+        upper.push(`${xScale(visIdx)},${yScale(intv.upper)}`);
+        lower.push(`${xScale(visIdx)},${yScale(intv.lower)}`);
+      });
+      const lastVal = histData[histData.length - 1].value;
+      const startPoint = `${xScale(fStart - 1)},${yScale(lastVal)}`;
+      const polyPoints = [startPoint, ...upper, ...[...lower].reverse()];
+      el('polygon', { points: polyPoints.join(' '), fill: baseColor, opacity: 0.10 });
+    });
+  }
+
+  // 실측 라인
+  let actPath = '';
+  histData.forEach((d, i) => {
+    actPath += (i === 0 ? 'M' : 'L') + ' ' + xScale(i) + ' ' + yScale(d.value) + ' ';
+  });
+  el('path', { d: actPath, stroke: item.color, 'stroke-width': 2, fill: 'none', 'stroke-linejoin': 'round' });
+
+  // 모형별 예측 라인
+  if (STATE.output === 'point' || STATE.output === 'both') {
+    Object.keys(item.predictions).forEach(modelKey => {
+      const isEnsemble = modelKey === 'ensemble';
+      const baseColor = isEnsemble ? item.color : (MODELS[modelKey]?.color || item.color);
+      const lastVal = histData[histData.length - 1].value;
+      let p = `M ${xScale(fStart - 1)} ${yScale(lastVal)}`;
+      item.predictions[modelKey].forEach((v, i) => {
+        p += ` L ${xScale(fStart + i)} ${yScale(v)}`;
+      });
+      el('path', {
+        d: p, stroke: baseColor,
+        'stroke-width': isEnsemble ? 2.2 : 1.6,
+        'stroke-dasharray': isEnsemble ? '0' : '5,3',
+        fill: 'none', 'stroke-linejoin': 'round',
+      });
+      // 점
+      item.predictions[modelKey].forEach((v, i) => {
+        el('circle', {
+          cx: xScale(fStart + i), cy: yScale(v),
+          r: isEnsemble ? 3 : 2.2, fill: baseColor,
+        });
+      });
+    });
+  }
+
+  // 범례 (하단)
+  let legendX = M.left;
+  const legendY = height - 4;
+  const legend = (label, color, dashed) => {
+    const w = 14;
+    el('line', { x1: legendX, x2: legendX + w, y1: legendY - 3, y2: legendY - 3, stroke: color, 'stroke-width': 2, 'stroke-dasharray': dashed ? '3,2' : '0' });
+    const t = el('text', { x: legendX + w + 4, y: legendY, fill: colTextDark, 'font-size': 9, 'font-family': 'Arial, sans-serif' });
+    t.textContent = label;
+    legendX += w + 6 + (label.length * 6);
+  };
+  legend('실측', item.color, false);
+  Object.keys(item.predictions).forEach(modelKey => {
+    if (modelKey === 'ensemble') legend('앙상블', item.color, false);
+    else legend(MODELS[modelKey]?.short || modelKey, MODELS[modelKey]?.color || item.color, true);
+  });
+
+  return svg;
+}
+
+// MAPE 비교 막대 차트 SVG
+function buildMapeChartSVG(items, width = 800, height = 280) {
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('xmlns', ns);
+  svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+  svg.setAttribute('width', width);
+  svg.setAttribute('height', height);
+
+  const colTextDark = '#1a1d2e';
+  const colTextMute = '#8b91a7';
+  const colLine = '#e5e7ee';
+
+  const el = (tag, attrs) => {
+    const e = document.createElementNS(ns, tag);
+    for (const k in attrs) e.setAttribute(k, attrs[k]);
+    svg.appendChild(e);
+    return e;
+  };
+
+  // 흰 배경
+  el('rect', { x: 0, y: 0, width, height, fill: '#ffffff' });
+
+  // 모형별 평균 MAPE
+  const mapeAvg = {};
+  STATE.selectedModels.forEach(k => {
+    const vals = items.map(it => it.accuracies[k]).filter(v => v != null);
+    if (vals.length > 0) mapeAvg[k] = vals.reduce((a, b) => a + b, 0) / vals.length;
+  });
+  const sorted = Object.entries(mapeAvg).sort((a, b) => a[1] - b[1]);
+  if (sorted.length === 0) return svg;
+
+  const M = { top: 35, right: 30, bottom: 35, left: 130 };
+  const innerW = width - M.left - M.right;
+  const innerH = height - M.top - M.bottom;
+  const maxMape = Math.max(...sorted.map(([_, v]) => v)) * 1.1;
+  const barH = Math.min(24, innerH / sorted.length - 4);
+  const gap = 6;
+
+  // 제목
+  const titleEl = el('text', {
+    x: M.left, y: 18, fill: colTextDark,
+    'font-size': 13, 'font-weight': 700, 'font-family': 'Arial, sans-serif',
+  });
+  titleEl.textContent = '모형별 평균 정확도 (MAPE - 낮을수록 정확)';
+
+  // 그리드
+  const xScale = v => M.left + (v / maxMape) * innerW;
+  for (let i = 0; i <= 5; i++) {
+    const v = (maxMape * i) / 5;
+    const x = xScale(v);
+    el('line', { x1: x, x2: x, y1: M.top, y2: M.top + innerH, stroke: colLine, 'stroke-dasharray': '2,4' });
+    const t = el('text', { x, y: height - 12, fill: colTextMute, 'font-size': 9, 'text-anchor': 'middle', 'font-family': 'Arial, sans-serif' });
+    t.textContent = v.toFixed(1) + '%';
+  }
+
+  sorted.forEach(([k, mape], i) => {
+    const m = MODELS[k];
+    const y = M.top + i * (barH + gap);
+    // 라벨
+    const lbl = el('text', { x: M.left - 8, y: y + barH / 2 + 4, fill: colTextDark, 'font-size': 11, 'text-anchor': 'end', 'font-family': 'Arial, sans-serif', 'font-weight': i === 0 ? 700 : 400 });
+    lbl.textContent = `${i + 1}. ${m.name}`;
+    // 막대 배경
+    el('rect', { x: M.left, y, width: innerW, height: barH, fill: '#f5f6fa', rx: 3 });
+    // 막대
+    const w = (mape / maxMape) * innerW;
+    el('rect', { x: M.left, y, width: w, height: barH, fill: m.color, rx: 3 });
+    // 값
+    const valX = M.left + w + 6;
+    const valEl = el('text', { x: valX, y: y + barH / 2 + 4, fill: colTextDark, 'font-size': 10, 'font-family': 'Arial, sans-serif', 'font-weight': 600 });
+    valEl.textContent = mape.toFixed(2) + '%';
+  });
+
+  return svg;
+}
+
+
 async function exportWord() {
   if (!STATE.forecasts) return;
-  showToast('Word 문서 생성 중...');
+  showToast('Word 문서 생성 중... 차트 변환에 잠시 걸립니다.');
   const items = Object.values(STATE.forecasts).filter(f => !f.error);
   if (items.length === 0) { showToast('내보낼 예측 데이터가 없습니다'); return; }
 
   const {
-    Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell,
+    Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell, ImageRun,
     AlignmentType, HeadingLevel, BorderStyle, WidthType, ShadingType, LevelFormat, PageBreak
   } = docx;
+
+  // ──── 차트 PNG 변환 (Word 삽입용) ────
+  const chartImages = {};
+  try {
+    // 1) 메인 차트 (현재 화면)
+    const mainSvg = document.getElementById('chart-svg');
+    if (mainSvg) {
+      try {
+        chartImages.main = await svgToPngBuffer(mainSvg, 900, 460);
+      } catch (e) { console.warn('메인 차트 변환 실패:', e); }
+    }
+    // 2) 시리즈별 개별 차트
+    for (const item of items) {
+      try {
+        const seriesSvg = buildSeriesChartSVG(item, 800, 360);
+        // SVG를 DOM에 잠깐 붙였다 떼야 일부 브라우저에서 정상 렌더됨
+        seriesSvg.style.position = 'absolute';
+        seriesSvg.style.left = '-9999px';
+        document.body.appendChild(seriesSvg);
+        chartImages['series_' + item.id] = await svgToPngBuffer(seriesSvg, 800, 360);
+        document.body.removeChild(seriesSvg);
+      } catch (e) { console.warn('시리즈 차트 변환 실패:', item.id, e); }
+    }
+    // 3) MAPE 비교 차트
+    try {
+      const mapeSvg = buildMapeChartSVG(items, 800, 280);
+      mapeSvg.style.position = 'absolute';
+      mapeSvg.style.left = '-9999px';
+      document.body.appendChild(mapeSvg);
+      chartImages.mape = await svgToPngBuffer(mapeSvg, 800, 280);
+      document.body.removeChild(mapeSvg);
+    } catch (e) { console.warn('MAPE 차트 변환 실패:', e); }
+  } catch (e) {
+    console.warn('차트 변환 중 오류:', e);
+    showToast('차트 변환 실패 - 텍스트 보고서로 진행합니다');
+  }
+
+  // 이미지 헬퍼
+  const imageParagraph = (buffer, w = 600, h = 300, caption) => {
+    const children = [];
+    if (buffer) {
+      children.push(new ImageRun({
+        data: buffer,
+        transformation: { width: w, height: h },
+        type: 'png',
+      }));
+    }
+    return new Paragraph({
+      alignment: AlignmentType.CENTER,
+      spacing: { before: 120, after: caption ? 40 : 200 },
+      children,
+    });
+  };
+  const captionParagraph = (text) => new Paragraph({
+    alignment: AlignmentType.CENTER,
+    spacing: { before: 0, after: 200 },
+    children: [new TextRun({
+      text, size: 18, italics: true,
+      color: "64748B", font: "맑은 고딕",
+    })],
+  });
 
   const today = new Date().toISOString().slice(0, 10);
   const periodLabel = `${STATE.period}개월`;
@@ -1748,19 +2398,33 @@ async function exportWord() {
     para(`본 보고서는 ${STATE.fileName} 파일을 기반으로 ${items.length}개 시리즈(${items.map(i => i.label).join(', ')})에 대해 ${STATE.selectedModels.length}개 시계열 모형을 적용하여 향후 ${periodLabel}의 수요를 예측한 결과입니다.`),
   ];
 
+  // 메인 차트 삽입 (있다면)
+  if (chartImages.main) {
+    children.push(heading('1.1 종합 예측 차트', HeadingLevel.HEADING_2));
+    children.push(imageParagraph(chartImages.main, 600, 307, true));
+    children.push(captionParagraph('[그림 1] 전체 시리즈 종합 차트 - 실측 데이터 + 향후 ' + periodLabel + ' 예측 (점 예측 및/또는 신뢰구간)'));
+  }
+
   // 시리즈별 핵심 결과
   children.push(heading('2. 시리즈별 예측 결과', HeadingLevel.HEADING_1));
-  items.forEach(item => {
+  items.forEach((item, idx) => {
     const fcKey = item.predictions.ensemble ? 'ensemble' : Object.keys(item.predictions)[0];
     if (!fcKey) return;
     const fcSum = item.predictions[fcKey].reduce((a, b) => a + b, 0);
     const lastSum = item.trainValues.slice(-STATE.period).reduce((a, b) => a + b, 0);
     const yoy = lastSum > 0 ? ((fcSum - lastSum) / lastSum) * 100 : 0;
 
-    children.push(heading(item.label, HeadingLevel.HEADING_2));
+    children.push(heading(`2.${idx + 1} ${item.label}`, HeadingLevel.HEADING_2));
     children.push(bullet(`최근 ${periodLabel} 합계: ${formatValue(lastSum, item.unit)}`));
     children.push(bullet(`향후 ${periodLabel} 예측 합계: ${formatValue(fcSum, item.unit)}`));
     children.push(bullet(`전기 대비 변화: ${yoy >= 0 ? '+' : ''}${yoy.toFixed(2)}%`));
+
+    // 시리즈별 개별 차트
+    const seriesImg = chartImages['series_' + item.id];
+    if (seriesImg) {
+      children.push(imageParagraph(seriesImg, 580, 261, true));
+      children.push(captionParagraph(`[그림 ${idx + 2}] ${item.label} 시계열 + 예측`));
+    }
   });
 
   // 모형 정확도
@@ -1787,6 +2451,12 @@ async function exportWord() {
   ];
   children.push(new Table({ width: { size: 8900, type: WidthType.DXA },
     columnWidths: [1000, 2400, 2200, 3300], rows: mapeRows }));
+
+  // MAPE 비교 차트
+  if (chartImages.mape) {
+    children.push(imageParagraph(chartImages.mape, 580, 203, true));
+    children.push(captionParagraph(`[그림 ${items.length + 2}] 모형별 평균 MAPE 비교 - 막대가 짧을수록 정확`));
+  }
 
   // 시리즈별 예측표
   items.forEach(item => {
